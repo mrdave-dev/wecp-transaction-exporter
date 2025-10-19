@@ -160,6 +160,27 @@ type NormalizedTransactionRow = {
 
 type HeaderIndexMap = Map<string, number>;
 
+type ChartCodeEntry = {
+  code: string;
+  description: string;
+  categoryType: string;
+  isDeposit: boolean;
+  notes: string;
+};
+
+type ChartCodeLookup = {
+  mapByCode: Map<string, ChartCodeEntry>;
+  mapByDescription: Map<string, ChartCodeEntry>;
+};
+
+type ChartCodeCache = ChartCodeLookup & {
+  updatedAt: number;
+};
+
+const CHART_CODE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+let chartCodeCache: ChartCodeCache | null = null;
+
 function onOpen(): void {
   SpreadsheetApp.getUi()
     .createMenu('WECP')
@@ -365,6 +386,7 @@ function ensureTransactionsSheet(spreadsheet: GoogleAppsScript.Spreadsheet.Sprea
   } else {
     ensureCheckboxColumn(sheet, 'Submitted', TRANSACTION_HEADERS.indexOf('Submitted') + 1);
   }
+  applyCategoryValidation(spreadsheet);
 }
 
 function ensureChartCodesSheet(spreadsheet: GoogleAppsScript.Spreadsheet.Spreadsheet): void {
@@ -374,6 +396,8 @@ function ensureChartCodesSheet(spreadsheet: GoogleAppsScript.Spreadsheet.Spreads
   sheet.getRange(1, 1, 1, CHART_CODE_TABLE[0].length).setFontWeight('bold');
   sheet.autoResizeColumns(1, CHART_CODE_TABLE[0].length);
   sheet.setFrozenRows(1);
+  invalidateChartCodeCache();
+  applyCategoryValidation(spreadsheet);
 }
 
 function ensureFormTemplateSheet(spreadsheet: GoogleAppsScript.Spreadsheet.Spreadsheet): void {
@@ -418,6 +442,253 @@ function ensureCheckboxColumn(sheet: GoogleAppsScript.Spreadsheet.Sheet, header:
   if (lastRow > 1) {
     sheet.getRange(2, columnIndex, lastRow - 1, 1).insertCheckboxes();
   }
+}
+
+function onEdit(e: GoogleAppsScript.Events.SheetsOnEdit): void {
+  if (!e || !e.range) {
+    return;
+  }
+  const sheet = e.range.getSheet();
+  const spreadsheet = sheet.getParent();
+  const sheetName = sheet.getName();
+
+  if (sheetName === SHEET_NAMES.chartCodes) {
+    invalidateChartCodeCache();
+    applyCategoryValidation(spreadsheet);
+    return;
+  }
+
+  if (sheetName !== SHEET_NAMES.transactions) {
+    return;
+  }
+
+  const firstColumn = e.range.getColumn();
+  const lastColumn = firstColumn + e.range.getNumColumns() - 1;
+  const affectsCategoryCode =
+    firstColumn <= TRANSACTION_COLUMNS.categoryCode && lastColumn >= TRANSACTION_COLUMNS.categoryCode;
+  const affectsCategoryDescription =
+    firstColumn <= TRANSACTION_COLUMNS.categoryDescription &&
+    lastColumn >= TRANSACTION_COLUMNS.categoryDescription;
+
+  if (!affectsCategoryCode && !affectsCategoryDescription) {
+    return;
+  }
+
+  try {
+    handleCategoryFieldsEdit(sheet, e.range);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    spreadsheet.toast(message, 'WECP Expenses', 5);
+  }
+}
+
+function handleCategoryFieldsEdit(
+  sheet: GoogleAppsScript.Spreadsheet.Sheet,
+  editedRange: GoogleAppsScript.Spreadsheet.Range,
+): void {
+  const spreadsheet = sheet.getParent();
+  const chartCodeLookup = getChartCodeLookup(spreadsheet);
+  const editedColumns = new Set<number>();
+  for (let offset = 0; offset < editedRange.getNumColumns(); offset += 1) {
+    editedColumns.add(editedRange.getColumn() + offset);
+  }
+  const codeEdited = editedColumns.has(TRANSACTION_COLUMNS.categoryCode);
+  const descriptionEdited = editedColumns.has(TRANSACTION_COLUMNS.categoryDescription);
+  if (!codeEdited && !descriptionEdited) {
+    return;
+  }
+  const startRow = editedRange.getRow();
+  const numRows = editedRange.getNumRows();
+  const messages = new Set<string>();
+
+  for (let offset = 0; offset < numRows; offset += 1) {
+    const rowIndex = startRow + offset;
+    const codeCell = sheet.getRange(rowIndex, TRANSACTION_COLUMNS.categoryCode);
+    const descriptionCell = sheet.getRange(rowIndex, TRANSACTION_COLUMNS.categoryDescription);
+    const rawCode = toTrimmedString(codeCell.getValue());
+    const rawDescription = toTrimmedString(descriptionCell.getValue());
+
+    if (codeEdited && !rawCode && (!descriptionEdited || !rawDescription)) {
+      descriptionCell.clearContent();
+      continue;
+    }
+
+    if (descriptionEdited && !rawDescription && (!codeEdited || !rawCode)) {
+      codeCell.clearContent();
+      continue;
+    }
+
+    const entryFromCode = rawCode ? chartCodeLookup.mapByCode.get(rawCode) : undefined;
+    if (codeEdited && rawCode && !entryFromCode) {
+      codeCell.clearContent();
+      descriptionCell.clearContent();
+      messages.add(`Row ${rowIndex}: Unknown category code "${rawCode}".`);
+      continue;
+    }
+
+    const entryFromDescription = rawDescription
+      ? chartCodeLookup.mapByDescription.get(normalizeDescriptionKey(rawDescription))
+      : undefined;
+    if (descriptionEdited && rawDescription && !entryFromDescription) {
+      codeCell.clearContent();
+      descriptionCell.clearContent();
+      messages.add(`Row ${rowIndex}: Unknown category description "${rawDescription}".`);
+      continue;
+    }
+
+    let entry: ChartCodeEntry | undefined;
+    if (codeEdited && entryFromCode) {
+      entry = entryFromCode;
+    } else if (descriptionEdited && entryFromDescription) {
+      entry = entryFromDescription;
+    } else if (entryFromCode) {
+      entry = entryFromCode;
+    } else if (entryFromDescription) {
+      entry = entryFromDescription;
+    } else if (!rawCode && !rawDescription) {
+      continue;
+    } else {
+      codeCell.clearContent();
+      descriptionCell.clearContent();
+      continue;
+    }
+
+    const debitValue = coerceNumber(sheet.getRange(rowIndex, TRANSACTION_COLUMNS.debit).getValue());
+    const creditValue = coerceNumber(sheet.getRange(rowIndex, TRANSACTION_COLUMNS.credit).getValue());
+    const isDepositRow = isDepositTransaction(debitValue, creditValue);
+
+    if (isDepositRow && !entry.isDeposit) {
+      codeCell.clearContent();
+      descriptionCell.clearContent();
+      messages.add(`Row ${rowIndex}: Deposits must use a deposit-specific category.`);
+      continue;
+    }
+
+    if (!isDepositRow && entry.isDeposit) {
+      codeCell.clearContent();
+      descriptionCell.clearContent();
+      messages.add(`Row ${rowIndex}: Deposit categories can only be used on deposit transactions.`);
+      continue;
+    }
+
+    if (codeCell.getValue() !== entry.code) {
+      codeCell.setValue(entry.code);
+    }
+    if (descriptionCell.getValue() !== entry.description) {
+      descriptionCell.setValue(entry.description || '');
+    }
+  }
+
+  if (messages.size > 0) {
+    const combined = Array.from(messages).join('\n');
+    spreadsheet.toast(combined, 'WECP Expenses', 6);
+  }
+}
+
+function applyCategoryValidation(spreadsheet: GoogleAppsScript.Spreadsheet.Spreadsheet): void {
+  const transactionsSheet = spreadsheet.getSheetByName(SHEET_NAMES.transactions);
+  if (!transactionsSheet) {
+    return;
+  }
+
+  const maxRows = transactionsSheet.getMaxRows();
+  if (maxRows <= 1) {
+    return;
+  }
+
+  const codeColumnRange = transactionsSheet.getRange(
+    2,
+    TRANSACTION_COLUMNS.categoryCode,
+    maxRows - 1,
+    1,
+  );
+  const descriptionColumnRange = transactionsSheet.getRange(
+    2,
+    TRANSACTION_COLUMNS.categoryDescription,
+    maxRows - 1,
+    1,
+  );
+
+  const chartCodesSheet = spreadsheet.getSheetByName(SHEET_NAMES.chartCodes);
+  if (!chartCodesSheet || chartCodesSheet.getLastRow() <= 1) {
+    codeColumnRange.clearDataValidations();
+    descriptionColumnRange.clearDataValidations();
+    return;
+  }
+
+  const recordCount = chartCodesSheet.getLastRow() - 1;
+  const codesRange = chartCodesSheet.getRange(2, 1, recordCount, 1);
+  const descriptionsRange = chartCodesSheet.getRange(2, 2, recordCount, 1);
+
+  const codeValidation = SpreadsheetApp.newDataValidation()
+    .requireValueInRange(codesRange, true)
+    .setAllowInvalid(false)
+    .setHelpText('Select a category code from the ChartCodes tab.')
+    .build();
+
+  const descriptionValidation = SpreadsheetApp.newDataValidation()
+    .requireValueInRange(descriptionsRange, true)
+    .setAllowInvalid(false)
+    .setHelpText('Select a category description from the ChartCodes tab.')
+    .build();
+
+  codeColumnRange.setDataValidation(codeValidation);
+  descriptionColumnRange.setDataValidation(descriptionValidation);
+}
+
+function invalidateChartCodeCache(): void {
+  chartCodeCache = null;
+}
+
+function getChartCodeLookup(
+  spreadsheet: GoogleAppsScript.Spreadsheet.Spreadsheet,
+): ChartCodeLookup {
+  const now = Date.now();
+  if (chartCodeCache && now - chartCodeCache.updatedAt < CHART_CODE_CACHE_TTL_MS) {
+    return chartCodeCache;
+  }
+  const sheet = spreadsheet.getSheetByName(SHEET_NAMES.chartCodes);
+  if (!sheet) {
+    throw new Error('ChartCodes sheet not found.');
+  }
+  const lookup = loadChartCodeEntries(sheet);
+  chartCodeCache = { ...lookup, updatedAt: now };
+  return chartCodeCache;
+}
+
+function loadChartCodeEntries(
+  sheet: GoogleAppsScript.Spreadsheet.Sheet,
+): ChartCodeLookup {
+  const mapByCode = new Map<string, ChartCodeEntry>();
+  const mapByDescription = new Map<string, ChartCodeEntry>();
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) {
+    return { mapByCode, mapByDescription };
+  }
+  const values = sheet.getRange(2, 1, lastRow - 1, 5).getValues();
+  values.forEach((row) => {
+    const code = toTrimmedString(row[0]);
+    if (!code) {
+      return;
+    }
+    const entry: ChartCodeEntry = {
+      code,
+      description: toTrimmedString(row[1]),
+      categoryType: toTrimmedString(row[2]),
+      isDeposit: toBoolean(row[3]),
+      notes: toTrimmedString(row[4]),
+    };
+    mapByCode.set(code, entry);
+    const descriptionKey = normalizeDescriptionKey(entry.description);
+    if (descriptionKey && !mapByDescription.has(descriptionKey)) {
+      mapByDescription.set(descriptionKey, entry);
+    }
+  });
+  return { mapByCode, mapByDescription };
+}
+
+function isDepositTransaction(debit: number, credit: number): boolean {
+  return Math.abs(credit) > 0 && Math.abs(debit) === 0;
 }
 
 function processImportedCsv(payload: CsvImportPayload): ImportResult {
@@ -488,6 +759,7 @@ function processImportedCsv(payload: CsvImportPayload): ImportResult {
       .setNumberFormat('yyyy-mm-dd hh:mm');
     sheet.getRange(startRow, TRANSACTION_COLUMNS.submitted, newRows.length, 1).insertCheckboxes();
   }
+  applyCategoryValidation(spreadsheet);
 
   const totalRows = filteredRows.length - 1;
   const message = `${newRows.length} new row${newRows.length === 1 ? '' : 's'} imported from ${
@@ -627,6 +899,10 @@ function buildTransactionKey(
   ].join('|');
 }
 
+function normalizeDescriptionKey(value: string): string {
+  return normalizeDescription(value);
+}
+
 function normalizeDescription(value: string): string {
   return normalizeKeyPart(value).replace(/\s+/g, ' ');
 }
@@ -718,6 +994,17 @@ function coerceNumber(value: unknown): number {
     return 0;
   }
   return parseMoneyValue(stringValue, true);
+}
+
+function toBoolean(value: unknown): boolean {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  const stringValue = toTrimmedString(value).toLowerCase();
+  if (!stringValue) {
+    return false;
+  }
+  return ['true', 'yes', 'y', '1', 't', 'checked'].includes(stringValue);
 }
 
 function isRowEmpty(row: string[]): boolean {
