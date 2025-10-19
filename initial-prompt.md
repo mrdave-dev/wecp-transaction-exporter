@@ -71,3 +71,105 @@ Here's the process I'd like to implement:
 
   1. Confirm chart-of-accounts list structure and template fields so scripts can be parameterized instead of hard-coded.
   2. Decide on PDF packaging (single ZIP, merged PDF via Drive API, or per-transaction files) before implementation to avoid rework.
+
+---
+
+• Implementation Plan
+
+  - Phase 1 – Sheet Scaffold: Define core tabs (Transactions, ChartCodes, FormTemplate, ExportsLog, optional Config),
+    header schemas, named ranges, and initial validation rules; wire up script properties for defaults (template doc id,
+    export root folder).
+  - Phase 2 – CSV Importer: Build custom menu entry and dialog to accept Drive picker uploads, parse CSV with
+    normalization (date, amount, memo fields), hash to detect duplicates, append new rows, and log import summary with
+    row counts and rejects.
+  - Phase 3 – Categorization UX: Implement sidebar with autocomplete using ChartCodes, on-edit triggers that stamp
+    matched code/description, block edits on submitted rows, and auto-detect deposits to prevent expense categorization.
+  - Phase 4 – Export Workflow: Create sidebar flow to gather selected rows, choose target folder, duplicate FormTemplate,
+    merge transaction data, render PDFs (one per row) into a dated subfolder, and optionally mark rows submitted with
+    timestamp/user in Transactions.
+  - Phase 5 – Validation & Audit: Add data validation and error messaging for required fields, ensure deposit rows route
+    to alternate handling, append export batch metadata (date, preparer, totals, folder link) to ExportsLog, and maintain
+    change log for troubleshooting.
+  - Phase 6 – Testing & Deployment: Write clasp-compatible unit helpers or simple assertion functions for import/export
+    logic, add mock datasets for local validation, document setup steps (triggers, permissions, template linkage), and
+    prepare release checklist for production rollout.
+
+---
+
+Great! Everything's working. What should we implement next?
+
+
+• We’re in good shape. Next logical pieces:
+
+  1. Build the initial Transactions, ChartCodes, and FormTemplate tabs with headers + sample data; that lets us start
+     testing sheet-driven logic.
+  2. Wire a typed Sheet service layer (range access helpers, schema enums) so import/export code stays consistent.
+  3. Implement the actual CSV importer stub—file picker dialog, Drive file read, row dedupe, append.
+
+  Any of those sound good; just let me know which one you want to tackle first.
+
+
+› Let's start with number 1. What do you need from me before you start implementing?
+
+
+• To scaffold those tabs cleanly, I need a bit of detail from you:
+
+  - Transactions sheet: exact column headers/order you want (e.g., Date, Payee, Amount, Chart Code, Status, Notes, etc.)
+    and any default formats or sample rows to seed.
+  - ChartCodes sheet: columns to include (code, description, category type, isDeposit flag, maybe ECC notes?) plus a
+    handful of starter entries if you have them.
+  - FormTemplate sheet: what fields should appear on the expense form (and placeholder values) so we can lay out the
+    template grid that future exports will clone.
+
+  If you already have a legacy sheet or doc we should mirror, feel free to summarize or link the structure. Once I have
+  that, I’ll wire up the initial tabs.
+
+---
+
+The bank exports come in CSV format and contain the following headers:
+
+Account Number
+Post Date
+Check
+Description
+Debit
+Credit
+Status
+Balance
+
+I've added 'Prepared' and 'Notes' columns but those can be kept, changed, or discarded.
+
+The expense allocation form is pictured here: examples/2025-10-19_12-56-23.png
+
+I have already parsed the form, here in CSV format:
+
+```csv
+Expense Code,Expense Description,Amount
+40300,Fee Refunds,
+62200,Professional Development,
+63000,"Fundraising: List Event- Read a thon",12.00
+64000,School Dist Teacher Consult,
+64100,In-Out Expense: Specify-,
+65000,Professional Consult Fees,
+65100,ICC Fees,
+65200,CC Tuition,
+65500,Legal/License Fees,
+66000,Curriculum Expenses,20.00
+66200,Other Supplies,9.00
+66300,Class Enrichment Prof.,
+66400,Toys/Equipment Expense,59.10
+66500,Fieldtrips,
+67000,Sunshine Fund,
+67100,Membership Events,
+67200,Meetings and Speakers,
+68000,Rent,
+68100,Utilities/Storage,
+68200,Telephone,
+68300,Maintenance Expenses,
+69000,Office Supplies,
+69100,Promotion & Marketing,
+69200,Website/Publ. Expense,
+69300,Insurance,
+Reserve,Specify-,
+Other,Specify-,
+```
