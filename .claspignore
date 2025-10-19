@@ -1,0 +1,9 @@
+node_modules/**
+src/**
+package.json
+package-lock.json
+tsconfig.json
+initial-prompt.md
+README.md
+.gitignore
+.claspignore
