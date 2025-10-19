@@ -110,11 +110,61 @@ const FORM_TEMPLATE_TABLE_ROWS: (string | number)[][] = [
   ['Other', 'Specify-', ''],
 ];
 
+const SOURCE_TRANSACTION_HEADERS = [
+  'Account Number',
+  'Post Date',
+  'Check',
+  'Description',
+  'Debit',
+  'Credit',
+  'Status',
+  'Balance',
+] as const;
+
+const TRANSACTION_COLUMNS = {
+  accountNumber: TRANSACTION_HEADERS.indexOf('Account Number') + 1,
+  postDate: TRANSACTION_HEADERS.indexOf('Post Date') + 1,
+  check: TRANSACTION_HEADERS.indexOf('Check') + 1,
+  description: TRANSACTION_HEADERS.indexOf('Description') + 1,
+  debit: TRANSACTION_HEADERS.indexOf('Debit') + 1,
+  credit: TRANSACTION_HEADERS.indexOf('Credit') + 1,
+  status: TRANSACTION_HEADERS.indexOf('Status') + 1,
+  balance: TRANSACTION_HEADERS.indexOf('Balance') + 1,
+  categoryCode: TRANSACTION_HEADERS.indexOf('Category Code') + 1,
+  categoryDescription: TRANSACTION_HEADERS.indexOf('Category Description') + 1,
+  preparedBy: TRANSACTION_HEADERS.indexOf('Prepared By') + 1,
+  notes: TRANSACTION_HEADERS.indexOf('Notes') + 1,
+  submitted: TRANSACTION_HEADERS.indexOf('Submitted') + 1,
+  submittedAt: TRANSACTION_HEADERS.indexOf('Submitted At') + 1,
+} as const;
+
+type CsvImportPayload = {
+  filename: string;
+  content: string;
+};
+
+type ImportResult = {
+  message: string;
+  filename: string;
+  totalRows: number;
+  importedRows: number;
+  duplicateRows: number;
+  skippedRows: number;
+  errors: string[];
+};
+
+type NormalizedTransactionRow = {
+  key: string;
+  values: (string | number | boolean | Date)[];
+};
+
+type HeaderIndexMap = Map<string, number>;
+
 function onOpen(): void {
   SpreadsheetApp.getUi()
     .createMenu('WECP')
     .addItem('Launch Expense Tools', 'showWelcomeSidebar')
-    .addItem('Import Transactions', 'importTransactionsStub')
+    .addItem('Import Transactions', 'showImportDialog')
     .addItem('Setup Workbook Tabs', 'setupWorkbookScaffold')
     .addToUi();
 }
@@ -133,15 +183,158 @@ function showWelcomeSidebar(): void {
   SpreadsheetApp.getUi().showSidebar(html);
 }
 
-/**
- * Placeholder import handler until CSV ingestion is implemented.
- */
-function importTransactionsStub(): void {
-  SpreadsheetApp.getActiveSpreadsheet().toast(
-    'Import workflow not yet implemented.',
-    'WECP Expenses',
-    5,
+function showImportDialog(): void {
+  const html = createImportDialogHtml();
+  SpreadsheetApp.getUi().showModalDialog(html, 'Import Transactions CSV');
+}
+
+function createImportDialogHtml(): GoogleAppsScript.HTML.HtmlOutput {
+  const html = HtmlService.createHtmlOutput(
+    String.raw`<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+  </head>
+  <body>
+    <div class="container">
+      <h2>Import Transactions CSV</h2>
+      <p>Select the bank export CSV. New rows will be appended and duplicates skipped.</p>
+      <input type="file" id="csvFile" accept=".csv" />
+      <div class="actions">
+        <button id="importBtn" disabled>Import</button>
+        <button id="cancelBtn" type="button">Cancel</button>
+      </div>
+      <div id="status" class="status"></div>
+    </div>
+    <script>
+      const fileInput = document.getElementById('csvFile');
+      const importBtn = document.getElementById('importBtn');
+      const cancelBtn = document.getElementById('cancelBtn');
+      const status = document.getElementById('status');
+
+      fileInput.addEventListener('change', () => {
+        updateStatus('');
+        importBtn.disabled = fileInput.files.length === 0;
+      });
+
+      cancelBtn.addEventListener('click', () => google.script.host.close());
+
+      importBtn.addEventListener('click', () => {
+        if (!fileInput.files.length) {
+          updateStatus('Choose a CSV file first.', true);
+          return;
+        }
+        const file = fileInput.files[0];
+        const fileName = file && file.name ? file.name.trim() : '';
+        if (!fileName.toLowerCase().endsWith('.csv')) {
+          updateStatus('Please select a .csv file.', true);
+          return;
+        }
+        importBtn.disabled = true;
+        updateStatus('Reading file…', false);
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          updateStatus('Uploading to spreadsheet…', false);
+          const content = event && event.target ? event.target.result : '';
+          google.script.run
+            .withSuccessHandler((result) => {
+              const summary = result && result.message ? result.message : 'Import complete.';
+              let detail = summary;
+              if (result) {
+                detail =
+                  summary +
+                  '\\nImported: ' +
+                  result.importedRows +
+                  ', Duplicates: ' +
+                  result.duplicateRows +
+                  ', Skipped: ' +
+                  result.skippedRows;
+              }
+              updateStatus(detail, false);
+              if (result && Array.isArray(result.errors) && result.errors.length) {
+                const list = document.createElement('ul');
+                list.className = 'error-list';
+                result.errors.forEach((err) => {
+                  const li = document.createElement('li');
+                  li.textContent = err;
+                  list.appendChild(li);
+                });
+                status.appendChild(list);
+              }
+              setTimeout(() => google.script.host.close(), 2500);
+            })
+            .withFailureHandler((err) => {
+              const message = err && err.message ? err.message : String(err);
+              updateStatus(message, true);
+              importBtn.disabled = false;
+            })
+            .processImportedCsv({ filename: file.name, content: content || '' });
+        };
+        reader.onerror = () => {
+          updateStatus('Could not read the selected file.', true);
+          importBtn.disabled = false;
+        };
+        reader.readAsText(file);
+      });
+
+      function updateStatus(message, isError) {
+        status.textContent = message;
+        status.className = 'status' + (isError ? ' error' : '');
+      }
+    </script>
+    <style>
+      body {
+        font-family: Roboto, Arial, sans-serif;
+        margin: 0;
+        padding: 16px;
+      }
+      .container {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      h2 {
+        font-size: 18px;
+        margin: 0;
+      }
+      p {
+        margin: 0;
+        font-size: 13px;
+        color: #333;
+      }
+      input[type="file"] {
+        font-size: 13px;
+      }
+      .actions {
+        display: flex;
+        gap: 8px;
+      }
+      button {
+        padding: 6px 12px;
+        font-size: 13px;
+      }
+      .status {
+        min-height: 24px;
+        font-size: 12px;
+        white-space: pre-line;
+      }
+      .status.error {
+        color: #b00020;
+      }
+      .error-list {
+        margin: 6px 0 0;
+        padding-left: 18px;
+        font-size: 12px;
+        color: #b00020;
+      }
+    </style>
+  </body>
+</html>`,
   );
+  html.setWidth(420);
+  html.setHeight(260);
+  html.setSandboxMode(HtmlService.SandboxMode.IFRAME);
+  return html;
 }
 
 /**
@@ -225,4 +418,308 @@ function ensureCheckboxColumn(sheet: GoogleAppsScript.Spreadsheet.Sheet, header:
   if (lastRow > 1) {
     sheet.getRange(2, columnIndex, lastRow - 1, 1).insertCheckboxes();
   }
+}
+
+function processImportedCsv(payload: CsvImportPayload): ImportResult {
+  if (!payload || !payload.content) {
+    throw new Error('No CSV content received.');
+  }
+
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = spreadsheet.getSheetByName(SHEET_NAMES.transactions);
+  if (!sheet) {
+    throw new Error('Transactions sheet not found. Run the setup first.');
+  }
+
+  const csvContent = payload.content.replace(/^\uFEFF/, '');
+  const parsedRows = Utilities.parseCsv(csvContent);
+  const filteredRows = parsedRows.filter((row) => !isRowEmpty(row));
+
+  if (filteredRows.length === 0) {
+    throw new Error('The CSV file was empty.');
+  }
+
+  const headerRow = filteredRows[0].map((cell) => cell.trim());
+  const headerIndex = buildHeaderIndex(headerRow);
+  validateSourceHeaders(headerIndex);
+
+  const existingKeys = collectTransactionKeys(sheet);
+  const seenKeys = new Set(existingKeys);
+  const newRows: (string | number | boolean | Date)[][] = [];
+  let duplicateRows = 0;
+  let skippedRows = 0;
+  const errors: string[] = [];
+
+  for (let i = 1; i < filteredRows.length; i += 1) {
+    const rawRow = filteredRows[i];
+    try {
+      const normalized = normalizeTransactionCsvRow(rawRow, headerIndex);
+      if (!normalized) {
+        skippedRows += 1;
+        continue;
+      }
+      if (seenKeys.has(normalized.key)) {
+        duplicateRows += 1;
+        continue;
+      }
+      seenKeys.add(normalized.key);
+      newRows.push(normalized.values);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      errors.push(`Row ${i + 1}: ${message}`);
+      skippedRows += 1;
+    }
+  }
+
+  if (newRows.length > 0) {
+    const startRow = sheet.getLastRow() + 1;
+    sheet.getRange(startRow, 1, newRows.length, TRANSACTION_HEADERS.length).setValues(newRows);
+    sheet
+      .getRange(startRow, TRANSACTION_COLUMNS.postDate, newRows.length, 1)
+      .setNumberFormat('yyyy-mm-dd');
+    sheet
+      .getRange(startRow, TRANSACTION_COLUMNS.debit, newRows.length, 2)
+      .setNumberFormat('#,##0.00');
+    sheet
+      .getRange(startRow, TRANSACTION_COLUMNS.balance, newRows.length, 1)
+      .setNumberFormat('#,##0.00');
+    sheet
+      .getRange(startRow, TRANSACTION_COLUMNS.submittedAt, newRows.length, 1)
+      .setNumberFormat('yyyy-mm-dd hh:mm');
+    sheet.getRange(startRow, TRANSACTION_COLUMNS.submitted, newRows.length, 1).insertCheckboxes();
+  }
+
+  const totalRows = filteredRows.length - 1;
+  const message = `${newRows.length} new row${newRows.length === 1 ? '' : 's'} imported from ${
+    payload.filename
+  }. ${duplicateRows} duplicate${duplicateRows === 1 ? '' : 's'} skipped.`;
+
+  spreadsheet.toast(message, 'WECP Import', 5);
+
+  return {
+    message,
+    filename: payload.filename,
+    totalRows,
+    importedRows: newRows.length,
+    duplicateRows,
+    skippedRows,
+    errors,
+  };
+}
+
+function normalizeTransactionCsvRow(
+  row: string[],
+  headerIndex: HeaderIndexMap,
+): NormalizedTransactionRow | null {
+  const getCell = (header: string): string => {
+    const index = headerIndex.get(header);
+    if (index === undefined) {
+      return '';
+    }
+    return row[index] ?? '';
+  };
+
+  const accountNumber = toTrimmedString(getCell('Account Number'));
+  const rawPostDate = getCell('Post Date');
+  const postDate = parseDateValue(rawPostDate);
+  if (!postDate) {
+    throw new Error(`Invalid Post Date "${rawPostDate}"`);
+  }
+
+  const description = toTrimmedString(getCell('Description'));
+  const checkNumber = toTrimmedString(getCell('Check'));
+  const status = toTrimmedString(getCell('Status'));
+  const debit = parseMoneyValue(getCell('Debit'), true);
+  const credit = parseMoneyValue(getCell('Credit'), true);
+  const balance = parseMoneyValue(getCell('Balance'), true);
+
+  if (!description && debit === 0 && credit === 0) {
+    return null;
+  }
+
+  const key = buildTransactionKey(accountNumber, postDate, description, debit, credit, checkNumber);
+  const values: (string | number | boolean | Date)[] = [
+    accountNumber,
+    postDate,
+    checkNumber,
+    description,
+    debit,
+    credit,
+    status,
+    balance,
+    '',
+    '',
+    '',
+    '',
+    false,
+    '',
+  ];
+
+  return { key, values };
+}
+
+function buildHeaderIndex(headerRow: string[]): HeaderIndexMap {
+  const map: HeaderIndexMap = new Map();
+  headerRow.forEach((label, index) => {
+    map.set(label.trim(), index);
+  });
+  return map;
+}
+
+function validateSourceHeaders(headerIndex: HeaderIndexMap): void {
+  const missing = SOURCE_TRANSACTION_HEADERS.filter((column) => !headerIndex.has(column));
+  if (missing.length > 0) {
+    throw new Error(`Missing required column(s): ${missing.join(', ')}`);
+  }
+}
+
+function collectTransactionKeys(sheet: GoogleAppsScript.Spreadsheet.Sheet): Set<string> {
+  const keys = new Set<string>();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    return keys;
+  }
+
+  const existingRows = sheet
+    .getRange(2, 1, lastRow - 1, TRANSACTION_HEADERS.length)
+    .getValues();
+
+  existingRows.forEach((row) => {
+    const key = buildTransactionKeyFromExistingRow(row);
+    if (key) {
+      keys.add(key);
+    }
+  });
+
+  return keys;
+}
+
+function buildTransactionKeyFromExistingRow(row: unknown[]): string | null {
+  const accountNumber = toTrimmedString(row[0]);
+  const postDate = parseDateValue(row[1] as string | Date);
+  if (!postDate) {
+    return null;
+  }
+  const checkNumber = toTrimmedString(row[2]);
+  const description = toTrimmedString(row[3]);
+  const debit = coerceNumber(row[4]);
+  const credit = coerceNumber(row[5]);
+
+  return buildTransactionKey(accountNumber, postDate, description, debit, credit, checkNumber);
+}
+
+function buildTransactionKey(
+  accountNumber: string,
+  postDate: Date,
+  description: string,
+  debit: number,
+  credit: number,
+  checkNumber: string,
+): string {
+  const normalizedDate = normalizeDate(postDate);
+  return [
+    normalizeKeyPart(accountNumber),
+    formatDateKey(normalizedDate),
+    normalizeKeyPart(checkNumber),
+    normalizeDescription(description),
+    debit.toFixed(2),
+    credit.toFixed(2),
+  ].join('|');
+}
+
+function normalizeDescription(value: string): string {
+  return normalizeKeyPart(value).replace(/\s+/g, ' ');
+}
+
+function normalizeKeyPart(value: string): string {
+  return value ? value.trim().toUpperCase() : '';
+}
+
+function normalizeDate(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function formatDateKey(date: Date): string {
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, '0');
+  const day = `${date.getDate()}`.padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function parseDateValue(input: string | Date): Date | null {
+  if (input instanceof Date && !Number.isNaN(input.getTime())) {
+    return normalizeDate(input);
+  }
+
+  const value = toTrimmedString(input);
+  if (!value) {
+    return null;
+  }
+
+  const direct = new Date(value);
+  if (!Number.isNaN(direct.getTime())) {
+    return normalizeDate(direct);
+  }
+
+  const match = value.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
+  if (match) {
+    const month = Number(match[1]);
+    const day = Number(match[2]);
+    let year = Number(match[3]);
+    if (year < 100) {
+      year += year >= 70 ? 1900 : 2000;
+    }
+    return new Date(year, month - 1, day);
+  }
+
+  return null;
+}
+
+function parseMoneyValue(input: string | number, allowBlank = false): number {
+  if (typeof input === 'number') {
+    return input;
+  }
+  const value = toTrimmedString(input);
+  if (!value) {
+    return allowBlank ? 0 : 0;
+  }
+
+  let sanitized = value.replace(/[$,]/g, '');
+  let isNegative = false;
+  if (sanitized.startsWith('(') && sanitized.endsWith(')')) {
+    sanitized = sanitized.slice(1, -1);
+    isNegative = true;
+  }
+  if (sanitized.startsWith('-')) {
+    isNegative = true;
+  }
+
+  const numeric = Number(sanitized.replace(/^[+-]/, ''));
+  if (Number.isNaN(numeric)) {
+    throw new Error(`Invalid currency value "${value}"`);
+  }
+
+  return isNegative ? -numeric : numeric;
+}
+
+function toTrimmedString(value: unknown): string {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  return String(value).trim();
+}
+
+function coerceNumber(value: unknown): number {
+  if (typeof value === 'number') {
+    return value;
+  }
+  const stringValue = toTrimmedString(value);
+  if (!stringValue) {
+    return 0;
+  }
+  return parseMoneyValue(stringValue, true);
+}
+
+function isRowEmpty(row: string[]): boolean {
+  return row.every((cell) => toTrimmedString(cell) === '');
 }
